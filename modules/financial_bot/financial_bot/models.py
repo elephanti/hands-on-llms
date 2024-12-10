@@ -18,7 +18,8 @@ from transformers import (
     StoppingCriteriaList,
     TextIteratorStreamer,
     pipeline,
-    TextGenerationPipeline
+    TextGenerationPipeline,
+    FalconForCausalLM,
 )
 
 from transformers.generation.streamers import BaseStreamer
@@ -28,8 +29,8 @@ from transformers.generation.utils import (
     SampleEncoderDecoderOutput,
     LogitsProcessorList,
     SampleOutput,
-    validate_stopping_criteria
-
+    validate_stopping_criteria,
+    GenerationMixin
 )
 
 from financial_bot import constants
@@ -116,37 +117,7 @@ class StopOnTokens(StoppingCriteria):
         return False
 
 
-class EntropixAutoModelForCausalLM(AutoModelForCausalLM):
-    def __init__(self, config):
-        super().__init__(config)
-        self.enable_attention_metrics = False  # Config flag to enable attention-based adjustments
-
-    # def generate(self, input_ids, attention_mask=None, **generate_kwargs):
-    #     """
-    #     Custom generate method that integrates attention-based sampling adjustments.
-    #     """
-    #     if self.enable_attention_metrics:
-    #         generate_kwargs["output_attentions"] = True  # Ensure attentions are returned
-
-    #     # Run forward pass to obtain logits and attention scores
-    #     outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
-
-    #     logits = outputs.logits  # Logits for generated tokens
-    #     attentions = outputs.attentions  # Attention scores for all layers
-
-    #     # Compute custom attention metrics (e.g., entropy) from attention scores
-    #     attention_entropy = self.compute_attention_entropy(attentions)
-
-    #     # Adjust sampling parameters based on attention metrics
-    #     temperature = generate_kwargs.get("temperature", 1.0)  # Default temperature
-    #     dynamic_temperature = temperature * (1.0 - attention_entropy)  # Example adjustment
-
-    #     # Apply custom logits warper with adjusted parameters
-    #     logits_warper = AttentionBasedLogitsWarper(temperature=dynamic_temperature, attention_entropy=attention_entropy)
-
-    #     # Now that we have the logits warper, apply it to logits before sampling
-    #     # Custom sample method
-    #     return self.sample(input_ids, logits=logits, logits_warper=logits_warper, **generate_kwargs)
+class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin ):
 
     def compute_attention_entropy(self, attentions):
         """
@@ -522,7 +493,8 @@ def build_huggingface_pipeline(
         model=model,
         tokenizer=tokenizer,
         max_new_tokens=max_new_tokens,
-        temperature=temperature,
+        temperature=temperature, # TODO: Remove? Use as base?
+        do_sample=True, #Important!!
         streamer=streamer,
         stopping_criteria=stopping_criteria,
     )
@@ -562,7 +534,7 @@ def build_qlora_model(
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-    model = EntropixAutoModelForCausalLM.from_pretrained(
+    model = FalconForCausalLMWithEntropix.from_pretrained(
         pretrained_model_name_or_path,
         revision="main",
         quantization_config=bnb_config,
