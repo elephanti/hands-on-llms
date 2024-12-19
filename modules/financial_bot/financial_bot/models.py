@@ -1,11 +1,12 @@
 import logging
 import os
+import warnings
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-import warnings
 from torch import nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from comet_ml import API
 from langchain.llms import HuggingFacePipeline
@@ -23,6 +24,12 @@ from transformers import (
 )
 
 from transformers.generation.streamers import BaseStreamer
+from transformers.generation import (
+    TemperatureLogitsWarper,
+    TopKLogitsWarper,
+    TopPLogitsWarper,
+    LogitsProcessor
+)
 
 from transformers.generation.utils import (
     SampleDecoderOnlyOutput,
@@ -117,21 +124,130 @@ class StopOnTokens(StoppingCriteria):
         return False
 
 
-class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin ):
+class MinPLogitsWarper(LogitsProcessor):
+    """
+    [`LogitsProcessor`] that performs min-p, i.e. keeps all tokens that are above a minimum probability, scaled by the
+    probability of the most likely token. As a result, the filter becomes more agressive in the presence of
+    high-probability tokens, which is a sign of a confident output that we shouldn't deviate from.
 
-    def compute_attention_entropy(self, attentions):
-        """
-        Compute attention-based metrics (e.g., entropy) from attention scores.
-        """
-        attention_entropy = 0.0
-        # Compute entropy across attention heads and layers
-        for layer_attention in attentions:
-            probs = torch.nn.functional.softmax(layer_attention, dim=-1)
-            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
-            attention_entropy += entropy.mean(dim=1)  # Average across heads
-        # Return the aggregated entropy
-        return attention_entropy.mean().item()  # Single value entropy
+    Often used together with [`TemperatureLogitsWarper`]. Used as an alternative to [`TopPLogitsWarper`] and
+    [`TopKLogitsWarper`].
 
+    Created by @menhguin and @kalomaze (github handles). Code adapted from [this external PR](https://github.com/oobabooga/text-generation-webui/pull/4449/files)
+
+    Args:
+        min_p (`float`):
+            Minimum token probability, which will be scaled by the probability of the most likely token. It must be a
+            value between 0 and 1. Typical values are in the 0.01-0.2 range, comparably selective as setting `top_p` in
+            the 0.99-0.8 range (use the opposite of normal `top_p` values).
+        filter_value (`float`, *optional*, defaults to -inf):
+            All filtered values will be set to this float value.
+        min_tokens_to_keep (`int`, *optional*, defaults to 1):
+            Minimum number of tokens that cannot be filtered.
+    ```
+    """
+
+    def __init__(self, min_p: float, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
+        if not (0 <= min_p <= 1.0):
+            raise ValueError(f"`min_p` has to be a float in the [0, 1] interval, but is {min_p}")
+        if not isinstance(min_tokens_to_keep, int) or (min_tokens_to_keep < 1):
+            raise ValueError(f"`min_tokens_to_keep` has to be a positive integer, but is {min_tokens_to_keep}")
+
+        self.min_p = min_p
+        self.filter_value = filter_value
+        self.min_tokens_to_keep = min_tokens_to_keep
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        # Convert logits to probabilities
+        probs = torch.softmax(scores, dim=-1)
+        # Get the probability of the top token for each sequence in the batch
+        top_probs, _ = probs.max(dim=-1, keepdim=True)
+        # Calculate the actual min_p threshold by scaling min_p with the top token's probability
+        scaled_min_p = self.min_p * top_probs
+        # Create a mask for tokens that have a probability less than the scaled min_p
+        tokens_to_remove = probs < scaled_min_p
+
+        sorted_indices = torch.argsort(scores, descending=True, dim=-1)
+        sorted_indices_to_remove = torch.gather(tokens_to_remove, dim=-1, index=sorted_indices)
+        # Keep at least min_tokens_to_keep
+        sorted_indices_to_remove[..., : self.min_tokens_to_keep] = False
+
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        scores_processed = scores.masked_fill(indices_to_remove, self.filter_value)
+        return scores_processed
+    
+
+class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
+    """
+    This model is a subclass of `FalconForCausalLM` and implements the `sample` method with Entropix sampling.
+    """
+
+    def _calculate_varentropy_logsoftmax(self, logits: torch.FloatTensor, axis: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calculate the entropy and varentropy of the probability distribution using logsoftmax.
+        
+        Args:
+            logits (`torch.FloatTensor` of shape `(batch_size, config.vocab_size)`):
+                Prediction scores of a language modeling head.
+            axis (int, optional): The axis along which to calculate the entropy and varentropy. Defaults to -1.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing the entropy and varentropy of the probability
+            distribution.
+        """
+        LN_2 = 0.69314718056  # ln(2) = 1.0 / LOG2_E
+        log_probs = F.log_softmax(logits, dim=axis)
+        probs = torch.exp(log_probs)
+        entropy = -torch.sum(probs * log_probs, dim=axis) / LN_2  # Convert to base-2
+        varentropy = torch.sum(probs * (log_probs / LN_2 + entropy.unsqueeze(-1))**2, dim=axis)
+        return entropy, varentropy
+
+    def _calculate_metrics(self, logits: torch.FloatTensor, attention_scores: torch.FloatTensor) -> Dict[str, torch.Tensor]:
+        """
+        Calculate the entropy and varentropy of the probability distribution using logsoftmax.
+
+        Args:
+            logits (`torch.FloatTensor` of shape `(batch_size, config.vocab_size)`):
+                Prediction scores of a language modeling head.
+            attention_scores (Tuple of `torch.FloatTensor` of shape `(batch_size, config.n_heads, sequence_length, sequence_length)`):
+
+            Returns:
+                Dict[str, torch.Tensor]: A dictionary containing the calculated metrics.
+        """
+        import pdb; pdb.set_trace()
+        entropy, varentropy = self._calculate_varentropy_logsoftmax(logits)
+        all_attention_scores = torch.stack(attention_scores, dim=2) 
+        
+        # TODO: Should we calculate the attn entropy from the last layer only? Unclear from the paper.
+
+        last_layer_attention_scores = attention_scores[-1]
+
+        # Focus on the newly generated token (last token in the sequence)
+        new_token_attention_scores = last_layer_attention_scores[:, :, -1, :]  # shape: (batch_size, num_heads, seq_len)
+        attn_entropy, attn_varentropy = self._calculate_varentropy_logsoftmax(new_token_attention_scores)
+        avg_attn_entropy = torch.mean(attn_entropy, dim=1)
+        avg_attn_varentropy = torch.mean(attn_varentropy, dim=1)
+
+        # Calculate attention agreement across heads
+        # Calculate the mean attention distribution across all heads for the last token
+        mean_attention = torch.mean(new_token_attention_scores, dim=1)  # shape: (batch_size, seq_len)
+        
+        # Calculate the absolute difference between each head's attention and the mean attention
+        abs_diff = torch.abs(new_token_attention_scores - mean_attention.unsqueeze(1))  # shape: (batch_size, num_heads, seq_len)
+        
+        # Calculate the agreement by averaging the absolute differences across all sequence positions and across all heads
+        agreement = torch.mean(abs_diff, dim=(1, 2))  # shape: (batch_size, num_heads)
+                
+        interaction_strength = torch.mean(torch.abs(all_attention_scores), dim=(1, 2, 3, 4))
+        return {
+            "logits_entropy": entropy,
+            "logits_varentropy": varentropy,
+            "attn_entropy": avg_attn_entropy,
+            "attn_varentropy": avg_attn_varentropy,
+            "agreement": agreement,
+            "interaction_strength": interaction_strength
+        }
+    
     def sample(
         self,
         input_ids: torch.LongTensor,
@@ -260,8 +376,11 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin ):
         ['Today is a beautiful day, and we must do everything possible to make it a day of celebration.']
         ```"""
         # init values
-        import pdb; pdb.set_trace()
-        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+        if logits_processor or logits_warper:
+            warnings.warn(
+                "The logits_processor and logits_warper will be ignored when using Entropix. "
+                "These are not compatible with the Entropix method."
+            )
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
         if max_length is not None:
             warnings.warn(
@@ -270,7 +389,6 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin ):
                 UserWarning,
             )
             stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
-        logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
         if isinstance(eos_token_id, int):
@@ -325,7 +443,7 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin ):
             outputs = self(
                 **model_inputs,
                 return_dict=True,
-                output_attentions=output_attentions,
+                output_attentions=True,
                 output_hidden_states=output_hidden_states,
             )
 
@@ -333,10 +451,24 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin ):
                 continue  # don't waste resources running the code we don't need
 
             next_token_logits = outputs.logits[:, -1, :]
+            
+            # Call entropix method to obtain next_tokens, next_token_scores
+            import pdb; pdb.set_trace()
+            temperature = self.generation_config.temperature if hasattr(self.generation_config, "temperature") else 0.666
+            top_p = self.generation_config.top_p if hasattr(self.generation_config, "top_p") else 0.9
+            top_k = self.generation_config.top_k if hasattr(self.generation_config, "top_k") else 27
+            min_p = self.generation_config.min_p if hasattr(self.generation_config, "min_p") else 0.0
 
-            # pre-process distribution
-            next_token_scores = logits_processor(input_ids, next_token_logits)
-            next_token_scores = logits_warper(input_ids, next_token_scores)
+            # Using entropix method to sample next tokens
+            next_tokens, next_token_scores = self.entropix(
+                input_ids=input_ids,
+                logits=next_token_logits,
+                attention_scores=outputs.attentions,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p
+            )
 
             # Store scores, attentions and hidden_states when required
             if return_dict_in_generate:
@@ -355,11 +487,7 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin ):
                         if self.config.is_encoder_decoder
                         else (outputs.hidden_states,)
                     )
-
-            # sample
-            probs = nn.functional.softmax(next_token_scores, dim=-1)
-            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-
+            
             # finished sentences should have their next token be a padding token
             if eos_token_id is not None:
                 if pad_token_id is None:
@@ -415,25 +543,233 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin ):
         else:
             return input_ids
 
-class EntropixTextGenerationPipeline(TextGenerationPipeline):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def _forward(self, model_inputs, **generate_kwargs):
+    def entropix(self, input_ids: torch.LongTensor, logits: torch.FloatTensor, attention_scores: torch.FloatTensor,
+                         temperature : float = 0.666, top_p : float = 0.9, top_k : int = 27, min_p : float = 0.0) -> Tuple[torch.LongTensor, torch.FloatTensor]:
         """
-        Override _forward to pass dynamic attention-based warper during generation.
+        Entropix sampling function that uses the entropy and varentropy of the probability distribution to adjust the sampling strategy.
+
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary.
+            logits (`torch.FloatTensor` of shape `(batch_size, config.vocab_size)`):
+                Prediction scores of a language modeling head.
+            attention_scores (`torch.FloatTensor` of shape `(batch_size, config.n_heads, sequence_length, sequence_length)`):
+                Attention scores of the model.
+            temperature (float, optional): The temperature to use for sampling. Defaults to 0.666.
+            top_p (float, optional): The cumulative probability threshold for top-p sampling. Defaults to 0.9.
+            top_k (int, optional): The number of highest probability vocabulary tokens to keep for top-k sampling. Defaults to 27.
+            min_p (float, optional): The minimum cumulative probability threshold for sampling. Defaults to 0.0.
+
+        Returns:
+            Tuple[`torch.LongTensor`, `torch.FloatTensor`]:
+                A tuple containing:
+                    - The sampled token IDs (`torch.LongTensor` of shape `(batch_size,)`).
+                    - The final scores used for sampling (`torch.FloatTensor` of shape `(batch_size, config.vocab_size)`).
         """
-        # Ensure the model has attention metrics enabled
-        if self.model.enable_attention_metrics:
-            generate_kwargs["output_attentions"] = True
+        metrics = self._calculate_metrics(logits, attention_scores)
+        ent, vent = metrics["logits_entropy"], metrics["logits_varentropy"]
+        attn_ent, attn_vent = metrics["attn_entropy"], metrics["attn_varentropy"]
+        agreement = metrics["agreement"]
+        interaction_strength = metrics["interaction_strength"]
 
-        # Perform the generation with the custom model (which will apply the attention-based warper)
-        output = self.model.generate(**model_inputs, **generate_kwargs)
+        # Prepare output tokens
+        batch_size = logits.size(0)
+        sampled_tokens = torch.zeros(batch_size, dtype=torch.long, device=logits.device)
+        next_token_scores = torch.zeros_like(logits)
 
-        # Return the generated sequence along with any other desired info
-        return {"generated_sequence": output}
+        for i in range(batch_size):
+            import pdb; pdb.set_trace()
+            # Per-item metrics
+            ent_i, vent_i = ent[i], vent[i]
+            attn_ent_i, attn_vent_i = attn_ent[i], attn_vent[i]
+            agreement_i = agreement[i]
+            interaction_strength_i = interaction_strength[i]
+            input_ids_i = input_ids[i]
+
+            # Strategy selection
+            if ent_i < 0.1 and vent_i < 0.1:
+                # Flowing with unspoken intent
+                sampled_tokens[i] = torch.argmax(logits[i], dim=-1)
+                next_token_scores[i] = logits[i]
+            
+            elif ent_i > 3.0 and vent_i < 0.1:
+                # Asking clarifying questions
+                if 2564 not in input_ids_i:
+                    sampled_tokens[i] = 2564  # "Ask clarifying question" token
+                    next_token_scores[i] = logits[i]
+                else:
+                    temp_adj = 1.3 + 0.2 * attn_ent_i
+                    sampled_tokens[i], next_token_scores[i] = self._sample(
+                        input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
+                        temperature=min(1.5, temperature * temp_adj),
+                        top_p=top_p, top_k=top_k, min_p=min_p
+                    )[0]
+
+            elif ent_i < 5.0 and vent_i > 5.0:
+                # Exploring forks in the path
+                temp_adj = 1.2 + 0.3 * interaction_strength_i
+                top_k_adj = max(5, int(top_k * (1 + 0.5 * (1 - agreement_i))))
+                sampled_tokens[i], next_token_scores[i] = self._sample(
+                    input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
+                    temperature=min(1.5, temperature * temp_adj),
+                    top_p=top_p, top_k=top_k_adj, min_p=min_p
+                )[0]
+
+            elif ent_i > 5.0 and vent_i > 5.0:
+                # Resampling in the mist
+                temp_adj = 2.0 + 0.5 * attn_vent_i
+                top_p_adj = max(0.5, top_p - 0.2 * attn_ent_i)
+                sampled_tokens[i], next_token_scores[i] = self._sample(
+                    input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
+                    temperature=max(2.0, temperature * temp_adj),
+                    top_p=top_p_adj, top_k=top_k, min_p=min_p
+                )[0]
+
+            else:
+                # Middle ground: adaptive sampling
+                sampled_tokens[i], next_token_scores[i] = self._adaptive_sample(
+                    logits[i].unsqueeze(0),
+                    metrics, input_ids_i.unsqueeze(0),
+                    n_samples=5, base_temp=temperature, base_top_p=top_p, base_top_k=top_k, base_min_p=min_p
+                )[0]
+
+        return sampled_tokens, next_token_scores
     
+    def _sample(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, temperature : float = 0.666, 
+                top_p : float = 0.9, top_k : int = 27, min_p : float = 0.0) -> Tuple[torch.LongTensor, torch.FloatTensor]:
+        """
+        Sample from the distribution of possible next tokens, after applying temperature, top-k, top-p and min-p filtering.
 
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary.
+            scores (`torch.FloatTensor` of shape `(batch_size, config.vocab_size)`):
+                Prediction scores of a language modeling head.
+            temperature (`float`, *optional*, defaults to 0.666):
+                The value used to modulate the next token probabilities. Higher values mean more random completions.
+            top_p (`float`, *optional*, defaults to 0.9):
+                If set to float < 1, only the smallest set of most probable tokens with probabilities that add up to
+                `top_p` or higher are considered for sampling.
+            top_k (`int`, *optional*, defaults to 27):
+                The number of highest probability vocabulary tokens to keep for top-k-filtering.
+            min_p (`float`, *optional*, defaults to 0.0):
+                If set to float > 0, only the smallest set of most probable tokens with probabilities that add up to
+                `min_p` or higher are considered for sampling.
+
+        Returns:
+        Tuple[`torch.LongTensor`, `torch.FloatTensor`]:
+            A tuple containing:
+                - The sampled token IDs (`torch.LongTensor` of shape `(batch_size,)`).
+                - The final scores used for sampling (`torch.FloatTensor` of shape `(batch_size, config.vocab_size)`).
+        """
+        min_p = float(min_p)
+        top_k = int(top_k)
+        top_p = float(top_p)
+        temperature = float(temperature)
+        
+        next_token_scores = TemperatureLogitsWarper(temperature=temperature)(input_ids, scores)
+        
+        if min_p > 0.0:
+            next_token_scores = MinPLogitsWarper(min_p=min_p)(input_ids, next_token_scores)
+        
+        if top_k > 0:
+            next_token_scores = TopKLogitsWarper(top_k=top_k)(input_ids, next_token_scores)
+        
+        if top_p < 1:
+            next_token_scores = TopPLogitsWarper(top_p=top_p)(input_ids, next_token_scores)
+
+        probs = nn.functional.softmax(next_token_scores, dim=-1)
+        sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+
+        return sampled_tokens, next_token_scores
+
+    def _adaptive_sample(self, input_ids: torch.FloatTensor, scores: torch.FloatTensor, logits_entropy: torch.FloatTensor, 
+                        logits_varentropy: torch.FloatTensor, attn_entropy: torch.FloatTensor, attn_varentropy: torch.FloatTensor, 
+                        agreement: torch.FloatTensor, interaction_strength: torch.FloatTensor, n_samples: int,
+                        base_temp: float = 0.666, base_top_p: float = 0.90, base_top_k: int = 40, base_min_p: float = 0.03) -> Tuple[torch.LongTensor, torch.FloatTensor]:
+        """
+        Adaptive sampling function that uses the entropy and varentropy of the probability distribution to adjust the sampling strategy.
+
+        Args:
+            input_ids (`torch.FloatTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary.
+            scores (`torch.FloatTensor` of shape `(batch_size, config.vocab_size)`):
+                Prediction scores of a language modeling head.
+            logits_entropy (`torch.FloatTensor` of shape `(batch_size,)`):
+                The entropy of the logits.
+            logits_varentropy (`torch.FloatTensor` of shape `(batch_size,)`):
+                The varentropy of the logits.
+            attn_entropy (`torch.FloatTensor` of shape `(batch_size,)`):
+                The entropy of the attention scores.
+            attn_varentropy (`torch.FloatTensor` of shape `(batch_size,)`):
+                The varentropy of the attention scores.
+            agreement (`torch.FloatTensor` of shape `(batch_size,)`):
+                The agreement of the attention scores.
+            interaction_strength (`torch.FloatTensor` of shape `(batch_size,)`):
+                The interaction strength of the attention scores.
+            n_samples (int):
+                The number of samples to generate.
+            base_temp (float, optional): The base temperature to use for sampling. Defaults to 0.666.
+            base_top_p (float, optional): The base cumulative probability threshold for top-p sampling. Defaults to 0.9.
+            base_top_k (int, optional): The base number of highest probability vocabulary tokens to keep for top-k sampling. Defaults to 40.
+            base_min_p (float, optional): The base minimum cumulative probability threshold for sampling. Defaults to 0.03.
+
+        Return:
+            Tuple[`torch.LongTensor`, `torch.FloatTensor`]:
+            A tuple containing:
+                - The sampled token IDs (`torch.LongTensor` of shape `(batch_size,)`).
+                - The final scores used for sampling (`torch.FloatTensor` of shape `(batch_size, config.vocab_size)`).
+        """
+        logits_uncertainty = logits_entropy + logits_varentropy
+        attn_uncertainty = attn_entropy + attn_varentropy
+        temperature = base_temp * (1 + 0.3 * logits_uncertainty + 0.2 * attn_uncertainty - 0.2 * agreement)
+        top_p = torch.clamp(base_top_p * (1 + 0.1 * attn_varentropy), 0.1, 1.0)
+        top_k = int(torch.clamp(
+            torch.round(torch.tensor(base_top_k) * (1 + 0.3 * interaction_strength.item() - 0.2 * agreement.item())),
+            min=1,
+            max=100
+        ).item())
+        min_p = torch.clamp(base_min_p * (1 - 0.5 * logits_uncertainty), 0.01, 0.5)
+
+        samples = []
+        next_token_scores = []
+        for _ in range(n_samples):
+            sample, next_token_score = self._sample(input_ids, temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
+            samples.append(sample)
+            next_token_scores.append(next_token_score)
+
+        sample_scores = torch.stack([self._score_sample(sample, input_ids, logits_entropy, logits_varentropy, attn_entropy, 
+            attn_varentropy, agreement, interaction_strength) for sample in samples])
+        best_sample_idx = torch.argmax(sample_scores)
+        
+        return samples[best_sample_idx], next_token_scores[best_sample_idx]
+
+    def _score_sample(self, sample: torch.Tensor, input_ids:  torch.LongTensor, logits_entropy: torch.FloatTensor,
+                    logits_varentropy: torch.FloatTensor, attn_entropy: torch.FloatTensor,
+                    attn_varentropy: torch.FloatTensor, agreement: torch.FloatTensor,
+                    interaction_strength: torch.FloatTensor) -> torch.Tensor:
+        # Flatten the sample tensor and convert to long (int64)
+        sample_flat = sample.flatten().to(torch.long)
+        
+        # Create one-hot encoding
+        one_hot = F.one_hot(sample_flat, input_ids.shape[-1])
+        
+        # Reshape log_softmax output to match one_hot
+        log_probs = F.log_softmax(input_ids, dim=-1).view(-1, input_ids.shape[-1])
+        
+        # Calculate log probability
+        log_prob = torch.sum(log_probs * one_hot)
+        
+        confidence_score = (
+            (1 - logits_entropy) * 0.1 +
+            (1 - attn_entropy) * 0.2 +
+            (1 - logits_varentropy) * 0.3 +
+            (1 - attn_varentropy) * 0.4 +
+            agreement * 0.5 +
+            interaction_strength * 0.6
+        )
+        return log_prob + confidence_score
+    
 def build_huggingface_pipeline(
     llm_model_id: str,
     llm_lora_model_id: str,
