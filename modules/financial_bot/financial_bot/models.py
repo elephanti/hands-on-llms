@@ -214,7 +214,6 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
             Returns:
                 Dict[str, torch.Tensor]: A dictionary containing the calculated metrics.
         """
-        import pdb; pdb.set_trace()
         entropy, varentropy = self._calculate_varentropy_logsoftmax(logits)
         all_attention_scores = torch.stack(attention_scores, dim=2) 
         
@@ -452,8 +451,9 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
 
             next_token_logits = outputs.logits[:, -1, :]
             
+            # TODO: This doesn't work (values empty), need to find where to get the model configs from correctly
+            
             # Call entropix method to obtain next_tokens, next_token_scores
-            import pdb; pdb.set_trace()
             temperature = self.generation_config.temperature if hasattr(self.generation_config, "temperature") else 0.666
             top_p = self.generation_config.top_p if hasattr(self.generation_config, "top_p") else 0.9
             top_k = self.generation_config.top_k if hasattr(self.generation_config, "top_k") else 27
@@ -470,6 +470,7 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                 min_p=min_p
             )
 
+            # logger.info(f"Next tokens: {next_tokens}")
             # Store scores, attentions and hidden_states when required
             if return_dict_in_generate:
                 if output_scores:
@@ -567,6 +568,7 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                     - The final scores used for sampling (`torch.FloatTensor` of shape `(batch_size, config.vocab_size)`).
         """
         metrics = self._calculate_metrics(logits, attention_scores)
+        # logger.info("Metrics: %s", metrics)
         ent, vent = metrics["logits_entropy"], metrics["logits_varentropy"]
         attn_ent, attn_vent = metrics["attn_entropy"], metrics["attn_varentropy"]
         agreement = metrics["agreement"]
@@ -578,7 +580,6 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
         next_token_scores = torch.zeros_like(logits)
 
         for i in range(batch_size):
-            import pdb; pdb.set_trace()
             # Per-item metrics
             ent_i, vent_i = ent[i], vent[i]
             attn_ent_i, attn_vent_i = attn_ent[i], attn_vent[i]
@@ -589,53 +590,62 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
             # Strategy selection
             if ent_i < 0.1 and vent_i < 0.1:
                 # Flowing with unspoken intent
+                # logger.info(f"Flowing with unspoken intent (greedy sampling)")
                 sampled_tokens[i] = torch.argmax(logits[i], dim=-1)
                 next_token_scores[i] = logits[i]
             
-            elif ent_i > 3.0 and vent_i < 0.1:
+            elif ent_i > 3.0 and vent_i < 0.1:                    
+                # logger.info(f"Asking clarifying questions")
                 # Asking clarifying questions
                 if 2564 not in input_ids_i:
+                    # logger.info(f"Inserting 'ask clarifying question' token")
                     sampled_tokens[i] = 2564  # "Ask clarifying question" token
                     next_token_scores[i] = logits[i]
                 else:
                     temp_adj = 1.3 + 0.2 * attn_ent_i
-                    sampled_tokens[i], next_token_scores[i] = self._sample(
+                    # logger.info(f"temperature: {min(1.5, temperature * temp_adj)}, top_p: {top_p}, top_k: {top_k}, min_p: {min_p}")
+                    sampled_tokens[i], next_token_scores[i] = self._sample_internal(
                         input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
                         temperature=min(1.5, temperature * temp_adj),
                         top_p=top_p, top_k=top_k, min_p=min_p
-                    )[0]
+                    )
 
             elif ent_i < 5.0 and vent_i > 5.0:
                 # Exploring forks in the path
+                # logger.info(f"Exploring forks in the path (Exploration Sampling)")
                 temp_adj = 1.2 + 0.3 * interaction_strength_i
                 top_k_adj = max(5, int(top_k * (1 + 0.5 * (1 - agreement_i))))
-                sampled_tokens[i], next_token_scores[i] = self._sample(
+                # logger.info(f"temperature: {temperature * temp_adj}, top_p: {top_p}, top_k: {top_k_adj}, min_p: {min_p}")
+                sampled_tokens[i], next_token_scores[i] = self._sample_internal(
                     input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
                     temperature=min(1.5, temperature * temp_adj),
                     top_p=top_p, top_k=top_k_adj, min_p=min_p
-                )[0]
+                )
 
             elif ent_i > 5.0 and vent_i > 5.0:
                 # Resampling in the mist
+                # logger.info(f"Resampling in the mist (High Uncertainty Sampling)")
                 temp_adj = 2.0 + 0.5 * attn_vent_i
                 top_p_adj = max(0.5, top_p - 0.2 * attn_ent_i)
-                sampled_tokens[i], next_token_scores[i] = self._sample(
+                # logger.info(f"temperature: {max(2.0, temperature * temp_adj)}, top_p: {top_p_adj}, top_k: {top_k}, min_p: {min_p}")
+                sampled_tokens[i], next_token_scores[i] = self._sample_internal(
                     input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
                     temperature=max(2.0, temperature * temp_adj),
                     top_p=top_p_adj, top_k=top_k, min_p=min_p
-                )[0]
+                )
 
             else:
                 # Middle ground: adaptive sampling
+                # logger.info(f"Adaptive sampling")
                 sampled_tokens[i], next_token_scores[i] = self._adaptive_sample(
-                    logits[i].unsqueeze(0),
-                    metrics, input_ids_i.unsqueeze(0),
+                    input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
+                    ent_i, vent_i, attn_ent_i, attn_vent_i, agreement_i, interaction_strength_i,
                     n_samples=5, base_temp=temperature, base_top_p=top_p, base_top_k=top_k, base_min_p=min_p
-                )[0]
+                )
 
         return sampled_tokens, next_token_scores
     
-    def _sample(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, temperature : float = 0.666, 
+    def _sample_internal(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, temperature : float = 0.666, 
                 top_p : float = 0.9, top_k : int = 27, min_p : float = 0.0) -> Tuple[torch.LongTensor, torch.FloatTensor]:
         """
         Sample from the distribution of possible next tokens, after applying temperature, top-k, top-p and min-p filtering.
@@ -681,7 +691,7 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
         probs = nn.functional.softmax(next_token_scores, dim=-1)
         sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
 
-        return sampled_tokens, next_token_scores
+        return sampled_tokens[0], next_token_scores[0]
 
     def _adaptive_sample(self, input_ids: torch.FloatTensor, scores: torch.FloatTensor, logits_entropy: torch.FloatTensor, 
                         logits_varentropy: torch.FloatTensor, attn_entropy: torch.FloatTensor, attn_varentropy: torch.FloatTensor, 
@@ -734,17 +744,17 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
         samples = []
         next_token_scores = []
         for _ in range(n_samples):
-            sample, next_token_score = self._sample(input_ids, temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
+            sample, next_token_score = self._sample_internal(input_ids, scores, temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
             samples.append(sample)
             next_token_scores.append(next_token_score)
 
-        sample_scores = torch.stack([self._score_sample(sample, input_ids, logits_entropy, logits_varentropy, attn_entropy, 
+        sample_scores = torch.stack([self._score_sample(sample, scores, logits_entropy, logits_varentropy, attn_entropy, 
             attn_varentropy, agreement, interaction_strength) for sample in samples])
         best_sample_idx = torch.argmax(sample_scores)
         
         return samples[best_sample_idx], next_token_scores[best_sample_idx]
 
-    def _score_sample(self, sample: torch.Tensor, input_ids:  torch.LongTensor, logits_entropy: torch.FloatTensor,
+    def _score_sample(self, sample: torch.Tensor, scores:  torch.LongTensor, logits_entropy: torch.FloatTensor,
                     logits_varentropy: torch.FloatTensor, attn_entropy: torch.FloatTensor,
                     attn_varentropy: torch.FloatTensor, agreement: torch.FloatTensor,
                     interaction_strength: torch.FloatTensor) -> torch.Tensor:
@@ -752,10 +762,10 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
         sample_flat = sample.flatten().to(torch.long)
         
         # Create one-hot encoding
-        one_hot = F.one_hot(sample_flat, input_ids.shape[-1])
+        one_hot = F.one_hot(sample_flat, scores.shape[-1])
         
         # Reshape log_softmax output to match one_hot
-        log_probs = F.log_softmax(input_ids, dim=-1).view(-1, input_ids.shape[-1])
+        log_probs = F.log_softmax(scores, dim=-1).view(-1, scores.shape[-1])
         
         # Calculate log probability
         log_prob = torch.sum(log_probs * one_hot)
@@ -879,6 +889,16 @@ def build_qlora_model(
         trust_remote_code=False,
         cache_dir=str(cache_dir) if cache_dir else None,
     )
+
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     pretrained_model_name_or_path,
+    #     revision="main",
+    #     quantization_config=bnb_config,
+    #     load_in_4bit=True,
+    #     device_map="auto",
+    #     trust_remote_code=False,
+    #     cache_dir=str(cache_dir) if cache_dir else None,
+    # )
 
     tokenizer = AutoTokenizer.from_pretrained(
         pretrained_model_name_or_path,
