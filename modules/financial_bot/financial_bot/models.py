@@ -27,7 +27,7 @@ from transformers.generation import (
     TemperatureLogitsWarper,
     TopKLogitsWarper,
     TopPLogitsWarper,
-    LogitsProcessor
+    LogitsProcessor,
 )
 
 from transformers.generation.utils import (
@@ -36,7 +36,7 @@ from transformers.generation.utils import (
     LogitsProcessorList,
     SampleOutput,
     validate_stopping_criteria,
-    GenerationMixin
+    GenerationMixin,
 )
 
 from financial_bot import constants
@@ -148,17 +148,28 @@ class MinPLogitsWarper(LogitsProcessor):
     ```
     """
 
-    def __init__(self, min_p: float, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
+    def __init__(
+        self,
+        min_p: float,
+        filter_value: float = -float("Inf"),
+        min_tokens_to_keep: int = 1,
+    ):
         if not (0 <= min_p <= 1.0):
-            raise ValueError(f"`min_p` has to be a float in the [0, 1] interval, but is {min_p}")
+            raise ValueError(
+                f"`min_p` has to be a float in the [0, 1] interval, but is {min_p}"
+            )
         if not isinstance(min_tokens_to_keep, int) or (min_tokens_to_keep < 1):
-            raise ValueError(f"`min_tokens_to_keep` has to be a positive integer, but is {min_tokens_to_keep}")
+            raise ValueError(
+                f"`min_tokens_to_keep` has to be a positive integer, but is {min_tokens_to_keep}"
+            )
 
         self.min_p = min_p
         self.filter_value = filter_value
         self.min_tokens_to_keep = min_tokens_to_keep
 
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+    def __call__(
+        self, input_ids: torch.LongTensor, scores: torch.FloatTensor
+    ) -> torch.FloatTensor:
         # Convert logits to probabilities
         probs = torch.softmax(scores, dim=-1)
         # Get the probability of the top token for each sequence in the batch
@@ -169,25 +180,30 @@ class MinPLogitsWarper(LogitsProcessor):
         tokens_to_remove = probs < scaled_min_p
 
         sorted_indices = torch.argsort(scores, descending=True, dim=-1)
-        sorted_indices_to_remove = torch.gather(tokens_to_remove, dim=-1, index=sorted_indices)
+        sorted_indices_to_remove = torch.gather(
+            tokens_to_remove, dim=-1, index=sorted_indices
+        )
         # Keep at least min_tokens_to_keep
         sorted_indices_to_remove[..., : self.min_tokens_to_keep] = False
 
-        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        indices_to_remove = sorted_indices_to_remove.scatter(
+            1, sorted_indices, sorted_indices_to_remove
+        )
         scores_processed = scores.masked_fill(indices_to_remove, self.filter_value)
         return scores_processed
-    
+
 
 class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
     """
     This model is a subclass of `FalconForCausalLM` and implements the `sample` method with Entropix sampling.
     """
 
-    def _calculate_varentropy_logsoftmax(self, logits: torch.FloatTensor, 
-                                         axis: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _calculate_varentropy_logsoftmax(
+        self, logits: torch.FloatTensor, axis: int = -1
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Calculate the entropy and varentropy of the probability distribution using logsoftmax.
-        
+
         Args:
             logits (`torch.FloatTensor` of shape `(batch_size, config.vocab_size)`):
                 Prediction scores of a language modeling head.
@@ -201,11 +217,14 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
         log_probs = F.log_softmax(logits, dim=axis)
         probs = torch.exp(log_probs)
         entropy = -torch.sum(probs * log_probs, dim=axis) / LN_2  # Convert to base-2
-        varentropy = torch.sum(probs * (log_probs / LN_2 + entropy.unsqueeze(-1))**2, dim=axis)
+        varentropy = torch.sum(
+            probs * (log_probs / LN_2 + entropy.unsqueeze(-1)) ** 2, dim=axis
+        )
         return entropy, varentropy
 
-    def _calculate_metrics(self, logits: torch.FloatTensor, 
-                           attention_scores: torch.FloatTensor) -> Dict[str, torch.Tensor]:
+    def _calculate_metrics(
+        self, logits: torch.FloatTensor, attention_scores: torch.FloatTensor
+    ) -> Dict[str, torch.Tensor]:
         """
         Calculate the entropy and varentropy of the probability distribution using logsoftmax.
 
@@ -220,28 +239,32 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                 Dict[str, torch.Tensor]: A dictionary containing the calculated metrics.
         """
         entropy, varentropy = self._calculate_varentropy_logsoftmax(logits)
-        all_attention_scores = torch.stack(attention_scores, dim=2) 
-        
+        all_attention_scores = torch.stack(attention_scores, dim=2)
+
         last_layer_attention_scores = attention_scores[-1]
 
         # Focus on the newly generated token (last token in the sequence)
         new_token_attention_scores = last_layer_attention_scores[:, :, -1, :]
-        attn_entropy, attn_varentropy = self._calculate_varentropy_logsoftmax(new_token_attention_scores)
+        attn_entropy, attn_varentropy = self._calculate_varentropy_logsoftmax(
+            new_token_attention_scores
+        )
         avg_attn_entropy = torch.mean(attn_entropy, dim=1)
         avg_attn_varentropy = torch.mean(attn_varentropy, dim=1)
 
         # Calculate attention agreement across heads
         # Calculate the mean attention distribution across all heads for the last token
-        mean_attention = torch.mean(new_token_attention_scores, dim=1)  
-        
+        mean_attention = torch.mean(new_token_attention_scores, dim=1)
+
         # Calculate the absolute difference between each head's attention and the mean attention
-        abs_diff = torch.abs(new_token_attention_scores - mean_attention.unsqueeze(1)) 
-        
-        # Calculate the agreement by averaging the absolute differences across 
+        abs_diff = torch.abs(new_token_attention_scores - mean_attention.unsqueeze(1))
+
+        # Calculate the agreement by averaging the absolute differences across
         # all sequence positions and across all heads
         agreement = torch.mean(abs_diff, dim=(1, 2))
-                
-        interaction_strength = torch.mean(torch.abs(all_attention_scores), dim=(1, 2, 3, 4))
+
+        interaction_strength = torch.mean(
+            torch.abs(all_attention_scores), dim=(1, 2, 3, 4)
+        )
 
         return {
             "logits_entropy": entropy,
@@ -249,9 +272,9 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
             "attn_entropy": avg_attn_entropy,
             "attn_varentropy": avg_attn_varentropy,
             "agreement": agreement,
-            "interaction_strength": interaction_strength
+            "interaction_strength": interaction_strength,
         }
-    
+
     def sample(
         self,
         input_ids: torch.LongTensor,
@@ -273,8 +296,8 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
         *** Slightly modified version of the `sample` method from the `GenerationMixin`
           class in the transformers library. ***
 
-        Generates sequences of token ids for models with a language modeling head using 
-        Entropix sampling method and can be used for text-decoder, text-to-text, speech-to-text, 
+        Generates sequences of token ids for models with a language modeling head using
+        Entropix sampling method and can be used for text-decoder, text-to-text, speech-to-text,
         and vision-to-text models.
 
         <Tip warning={true}>
@@ -338,29 +361,55 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                 "These are not compatible with the Entropix method."
             )
 
-        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
-        
+        stopping_criteria = (
+            stopping_criteria
+            if stopping_criteria is not None
+            else StoppingCriteriaList()
+        )
+
         if max_length is not None:
             warnings.warn(
                 "`max_length` is deprecated in this function, use"
                 " `stopping_criteria=StoppingCriteriaList(MaxLengthCriteria(max_length=max_length))` instead.",
                 UserWarning,
             )
-            stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
+            stopping_criteria = validate_stopping_criteria(
+                stopping_criteria, max_length
+            )
 
-        pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
-        eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
-        
+        pad_token_id = (
+            pad_token_id
+            if pad_token_id is not None
+            else self.generation_config.pad_token_id
+        )
+        eos_token_id = (
+            eos_token_id
+            if eos_token_id is not None
+            else self.generation_config.eos_token_id
+        )
+
         if isinstance(eos_token_id, int):
             eos_token_id = [eos_token_id]
-        
-        eos_token_id_tensor = torch.tensor(eos_token_id).to(input_ids.device) if eos_token_id is not None else None
-        output_scores = output_scores if output_scores is not None else self.generation_config.output_scores
+
+        eos_token_id_tensor = (
+            torch.tensor(eos_token_id).to(input_ids.device)
+            if eos_token_id is not None
+            else None
+        )
+        output_scores = (
+            output_scores
+            if output_scores is not None
+            else self.generation_config.output_scores
+        )
         output_attentions = (
-            output_attentions if output_attentions is not None else self.generation_config.output_attentions
+            output_attentions
+            if output_attentions is not None
+            else self.generation_config.output_attentions
         )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.generation_config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.generation_config.output_hidden_states
         )
         return_dict_in_generate = (
             return_dict_in_generate
@@ -370,19 +419,33 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
 
         # init attention / hidden states / scores tuples
         scores = () if (return_dict_in_generate and output_scores) else None
-        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
-        cross_attentions = () if (return_dict_in_generate and output_attentions) else None
-        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
+        decoder_attentions = (
+            () if (return_dict_in_generate and output_attentions) else None
+        )
+        cross_attentions = (
+            () if (return_dict_in_generate and output_attentions) else None
+        )
+        decoder_hidden_states = (
+            () if (return_dict_in_generate and output_hidden_states) else None
+        )
 
         # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
         if return_dict_in_generate and self.config.is_encoder_decoder:
-            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+            encoder_attentions = (
+                model_kwargs["encoder_outputs"].get("attentions")
+                if output_attentions
+                else None
+            )
             encoder_hidden_states = (
-                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+                model_kwargs["encoder_outputs"].get("hidden_states")
+                if output_hidden_states
+                else None
             )
 
         # keep track of which sequences are already finished
-        unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
+        unfinished_sequences = torch.ones(
+            input_ids.shape[0], dtype=torch.long, device=input_ids.device
+        )
 
         this_peer_finished = False  # used by synced_gpus only
         # auto-regressive generation
@@ -390,7 +453,9 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
                 # The following logic allows an early break if all peers finished generating their sequence
-                this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(input_ids.device)
+                this_peer_finished_flag = torch.tensor(
+                    0.0 if this_peer_finished else 1.0
+                ).to(input_ids.device)
                 # send 0.0 if we finished, 1.0 otherwise
                 dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
                 # did all peers finish? the reduced sum will be 0.0 then
@@ -412,13 +477,28 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                 continue  # don't waste resources running the code we don't need
 
             next_token_logits = outputs.logits[:, -1, :]
-                        
+
             # Call entropix method to obtain next_tokens, next_token_scores
-            temperature = self.generation_config.temperature if hasattr(self.generation_config, 
-                                                                        "temperature") else 0.666
-            top_p = self.generation_config.top_p if hasattr(self.generation_config, "top_p") else 0.9
-            top_k = self.generation_config.top_k if hasattr(self.generation_config, "top_k") else 27
-            min_p = self.generation_config.min_p if hasattr(self.generation_config, "min_p") else 0.0
+            temperature = (
+                self.generation_config.temperature
+                if hasattr(self.generation_config, "temperature")
+                else 0.666
+            )
+            top_p = (
+                self.generation_config.top_p
+                if hasattr(self.generation_config, "top_p")
+                else 0.9
+            )
+            top_k = (
+                self.generation_config.top_k
+                if hasattr(self.generation_config, "top_k")
+                else 27
+            )
+            min_p = (
+                self.generation_config.min_p
+                if hasattr(self.generation_config, "min_p")
+                else 0.0
+            )
 
             # Using entropix method to sample next tokens
             next_tokens, next_token_scores = self.entropix(
@@ -428,7 +508,7 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
-                min_p=min_p
+                min_p=min_p,
             )
 
             # Store scores, attentions and hidden_states when required
@@ -437,7 +517,9 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                     scores += (next_token_scores,)
                 if output_attentions:
                     decoder_attentions += (
-                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+                        (outputs.decoder_attentions,)
+                        if self.config.is_encoder_decoder
+                        else (outputs.attentions,)
                     )
                     if self.config.is_encoder_decoder:
                         cross_attentions += (outputs.cross_attentions,)
@@ -448,12 +530,16 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                         if self.config.is_encoder_decoder
                         else (outputs.hidden_states,)
                     )
-            
+
             # finished sentences should have their next token be a padding token
             if eos_token_id is not None:
                 if pad_token_id is None:
-                    raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
-                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+                    raise ValueError(
+                        "If `eos_token_id` is defined, make sure that `pad_token_id` is defined."
+                    )
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (
+                    1 - unfinished_sequences
+                )
 
             # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
@@ -466,7 +552,9 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
             # if eos_token was found in one sentence, set sentence to finished
             if eos_token_id_tensor is not None:
                 unfinished_sequences = unfinished_sequences.mul(
-                    next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
+                    next_tokens.tile(eos_token_id_tensor.shape[0], 1)
+                    .ne(eos_token_id_tensor.unsqueeze(1))
+                    .prod(dim=0)
                 )
 
                 # stop when each sentence is finished
@@ -504,12 +592,18 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
         else:
             return input_ids
 
-    def entropix(self, input_ids: torch.LongTensor, logits: torch.FloatTensor,
-                 attention_scores: torch.FloatTensor, temperature : float = 0.666, 
-                 top_p : float = 0.9, top_k : int = 27, 
-                 min_p : float = 0.0) -> Tuple[torch.LongTensor, torch.FloatTensor]:
+    def entropix(
+        self,
+        input_ids: torch.LongTensor,
+        logits: torch.FloatTensor,
+        attention_scores: torch.FloatTensor,
+        temperature: float = 0.666,
+        top_p: float = 0.9,
+        top_k: int = 27,
+        min_p: float = 0.0,
+    ) -> Tuple[torch.LongTensor, torch.FloatTensor]:
         """
-        Entropix sampling function that uses the entropy and varentropy of the 
+        Entropix sampling function that uses the entropy and varentropy of the
         probability distribution to adjust the sampling strategy.
 
         Args:
@@ -517,12 +611,12 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                 Indices of input sequence tokens in the vocabulary.
             logits (`torch.FloatTensor` of shape `(batch_size, config.vocab_size)`):
                 Prediction scores of a language modeling head.
-            attention_scores (`torch.FloatTensor` of shape 
+            attention_scores (`torch.FloatTensor` of shape
             `(batch_size, config.n_heads, sequence_length, sequence_length)`):
                 Attention scores of the model.
             temperature (float, optional): The temperature to use for sampling. Defaults to 0.666.
             top_p (float, optional): The cumulative probability threshold for top-p sampling. Defaults to 0.9.
-            top_k (int, optional): The number of highest probability vocabulary tokens to 
+            top_k (int, optional): The number of highest probability vocabulary tokens to
                 keep for top-k sampling. Defaults to 27.
             min_p (float, optional): The minimum cumulative probability threshold for sampling. Defaults to 0.0.
 
@@ -530,7 +624,7 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
             Tuple[`torch.LongTensor`, `torch.FloatTensor`]:
                 A tuple containing:
                     - The sampled token IDs (`torch.LongTensor` of shape `(batch_size,)`).
-                    - The final scores used for sampling (`torch.FloatTensor` of 
+                    - The final scores used for sampling (`torch.FloatTensor` of
                         shape `(batch_size, config.vocab_size)`).
         """
         metrics = self._calculate_metrics(logits, attention_scores)
@@ -557,8 +651,8 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                 # Flowing with unspoken intent
                 sampled_tokens[i] = torch.argmax(logits[i], dim=-1)
                 next_token_scores[i] = logits[i]
-            
-            elif ent_i > 3.0 and vent_i < 0.1:                    
+
+            elif ent_i > 3.0 and vent_i < 0.1:
                 # Asking clarifying questions
                 if 2564 not in input_ids_i:
                     sampled_tokens[i] = 2564  # "Ask clarifying question" token
@@ -566,9 +660,12 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                 else:
                     temp_adj = 1.3 + 0.2 * attn_ent_i
                     sampled_tokens[i], next_token_scores[i] = self._sample_internal(
-                        input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
+                        input_ids_i.unsqueeze(0),
+                        logits[i].unsqueeze(0),
                         temperature=min(1.5, temperature * temp_adj),
-                        top_p=top_p, top_k=top_k, min_p=min_p
+                        top_p=top_p,
+                        top_k=top_k,
+                        min_p=min_p,
                     )
 
             elif ent_i < 5.0 and vent_i > 5.0:
@@ -576,9 +673,12 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                 temp_adj = 1.2 + 0.3 * interaction_strength_i
                 top_k_adj = max(5, int(top_k * (1 + 0.5 * (1 - agreement_i))))
                 sampled_tokens[i], next_token_scores[i] = self._sample_internal(
-                    input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
+                    input_ids_i.unsqueeze(0),
+                    logits[i].unsqueeze(0),
                     temperature=min(1.5, temperature * temp_adj),
-                    top_p=top_p, top_k=top_k_adj, min_p=min_p
+                    top_p=top_p,
+                    top_k=top_k_adj,
+                    min_p=min_p,
                 )
 
             elif ent_i > 5.0 and vent_i > 5.0:
@@ -586,24 +686,43 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                 temp_adj = 2.0 + 0.5 * attn_vent_i
                 top_p_adj = max(0.5, top_p - 0.2 * attn_ent_i)
                 sampled_tokens[i], next_token_scores[i] = self._sample_internal(
-                    input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
+                    input_ids_i.unsqueeze(0),
+                    logits[i].unsqueeze(0),
                     temperature=max(2.0, temperature * temp_adj),
-                    top_p=top_p_adj, top_k=top_k, min_p=min_p
+                    top_p=top_p_adj,
+                    top_k=top_k,
+                    min_p=min_p,
                 )
 
             else:
                 # Middle ground: adaptive sampling
                 sampled_tokens[i], next_token_scores[i] = self._adaptive_sample(
-                    input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
-                    ent_i, vent_i, attn_ent_i, attn_vent_i, agreement_i, interaction_strength_i,
-                    n_samples=5, base_temp=temperature, base_top_p=top_p, base_top_k=top_k, base_min_p=min_p
+                    input_ids_i.unsqueeze(0),
+                    logits[i].unsqueeze(0),
+                    ent_i,
+                    vent_i,
+                    attn_ent_i,
+                    attn_vent_i,
+                    agreement_i,
+                    interaction_strength_i,
+                    n_samples=5,
+                    base_temp=temperature,
+                    base_top_p=top_p,
+                    base_top_k=top_k,
+                    base_min_p=min_p,
                 )
 
         return sampled_tokens, next_token_scores
-    
-    def _sample_internal(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, 
-                         temperature : float = 0.666, top_p : float = 0.9,top_k : int = 27,
-                         min_p : float = 0.0) -> Tuple[torch.LongTensor, torch.FloatTensor]:
+
+    def _sample_internal(
+        self,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor,
+        temperature: float = 0.666,
+        top_p: float = 0.9,
+        top_k: int = 27,
+        min_p: float = 0.0,
+    ) -> Tuple[torch.LongTensor, torch.FloatTensor]:
         """
         Sample from the distribution of possible next tokens, after applying temperature,
          top-k, top-p and min-p filtering.
@@ -634,29 +753,47 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
         top_k = int(top_k)
         top_p = float(top_p)
         temperature = float(temperature)
-        
-        next_token_scores = TemperatureLogitsWarper(temperature=temperature)(input_ids, scores)
-        
+
+        next_token_scores = TemperatureLogitsWarper(temperature=temperature)(
+            input_ids, scores
+        )
+
         if min_p > 0.0:
-            next_token_scores = MinPLogitsWarper(min_p=min_p)(input_ids, next_token_scores)
-        
+            next_token_scores = MinPLogitsWarper(min_p=min_p)(
+                input_ids, next_token_scores
+            )
+
         if top_k > 0:
-            next_token_scores = TopKLogitsWarper(top_k=top_k)(input_ids, next_token_scores)
-        
+            next_token_scores = TopKLogitsWarper(top_k=top_k)(
+                input_ids, next_token_scores
+            )
+
         if top_p < 1:
-            next_token_scores = TopPLogitsWarper(top_p=top_p)(input_ids, next_token_scores)
+            next_token_scores = TopPLogitsWarper(top_p=top_p)(
+                input_ids, next_token_scores
+            )
 
         probs = nn.functional.softmax(next_token_scores, dim=-1)
         sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
 
         return sampled_tokens[0], next_token_scores[0]
 
-    def _adaptive_sample(self, input_ids: torch.FloatTensor, scores: torch.FloatTensor, 
-                         logits_entropy: torch.FloatTensor, logits_varentropy: torch.FloatTensor,
-                         attn_entropy: torch.FloatTensor, attn_varentropy: torch.FloatTensor,
-                         agreement: torch.FloatTensor, interaction_strength: torch.FloatTensor,
-                         n_samples: int, base_temp: float = 0.666, base_top_p: float = 0.90, 
-                         base_top_k: int = 40, base_min_p: float = 0.03) -> Tuple[torch.LongTensor, torch.FloatTensor]:
+    def _adaptive_sample(
+        self,
+        input_ids: torch.FloatTensor,
+        scores: torch.FloatTensor,
+        logits_entropy: torch.FloatTensor,
+        logits_varentropy: torch.FloatTensor,
+        attn_entropy: torch.FloatTensor,
+        attn_varentropy: torch.FloatTensor,
+        agreement: torch.FloatTensor,
+        interaction_strength: torch.FloatTensor,
+        n_samples: int,
+        base_temp: float = 0.666,
+        base_top_p: float = 0.90,
+        base_top_k: int = 40,
+        base_min_p: float = 0.03,
+    ) -> Tuple[torch.LongTensor, torch.FloatTensor]:
         """
         Adaptive sampling function that uses the entropy and varentropy of the probability distribution
          to adjust the sampling strategy.
@@ -681,11 +818,11 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
             n_samples (int):
                 The number of samples to generate.
             base_temp (float, optional): The base temperature to use for sampling. Defaults to 0.666.
-            base_top_p (float, optional): The base cumulative probability threshold for top-p sampling. 
+            base_top_p (float, optional): The base cumulative probability threshold for top-p sampling.
                 Defaults to 0.9.
             base_top_k (int, optional): The base number of highest probability vocabulary tokens to keep for
                 top-k sampling. Defaults to 40.
-            base_min_p (float, optional): The base minimum cumulative probability threshold for sampling. 
+            base_min_p (float, optional): The base minimum cumulative probability threshold for sampling.
                 Defaults to 0.03.
 
         Return:
@@ -696,57 +833,89 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
         """
         logits_uncertainty = logits_entropy + logits_varentropy
         attn_uncertainty = attn_entropy + attn_varentropy
-        temperature = base_temp * (1 + 0.3 * logits_uncertainty + 0.2 * attn_uncertainty - 0.2 * agreement)
+        temperature = base_temp * (
+            1 + 0.3 * logits_uncertainty + 0.2 * attn_uncertainty - 0.2 * agreement
+        )
         top_p = torch.clamp(base_top_p * (1 + 0.1 * attn_varentropy), 0.1, 1.0)
-        top_k = int(torch.clamp(
-            torch.round(torch.tensor(base_top_k) * (1 + 0.3 * interaction_strength.item() - 0.2 * agreement.item())),
-            min=1,
-            max=100
-        ).item())
+        top_k = int(
+            torch.clamp(
+                torch.round(
+                    torch.tensor(base_top_k)
+                    * (1 + 0.3 * interaction_strength.item() - 0.2 * agreement.item())
+                ),
+                min=1,
+                max=100,
+            ).item()
+        )
         min_p = torch.clamp(base_min_p * (1 - 0.5 * logits_uncertainty), 0.01, 0.5)
 
         samples = []
         next_token_scores = []
         for _ in range(n_samples):
-            sample, next_token_score = self._sample_internal(input_ids, scores, temperature=temperature, 
-                                                             top_p=top_p, top_k=top_k, min_p=min_p)
+            sample, next_token_score = self._sample_internal(
+                input_ids,
+                scores,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+            )
             samples.append(sample)
             next_token_scores.append(next_token_score)
 
-        sample_scores = torch.stack([self._score_sample(sample, scores, logits_entropy, 
-                                                        logits_varentropy, attn_entropy, 
-                                                        attn_varentropy, agreement, 
-                                                        interaction_strength) for sample in samples])
+        sample_scores = torch.stack(
+            [
+                self._score_sample(
+                    sample,
+                    scores,
+                    logits_entropy,
+                    logits_varentropy,
+                    attn_entropy,
+                    attn_varentropy,
+                    agreement,
+                    interaction_strength,
+                )
+                for sample in samples
+            ]
+        )
         best_sample_idx = torch.argmax(sample_scores)
-        
+
         return samples[best_sample_idx], next_token_scores[best_sample_idx]
 
-    def _score_sample(self, sample: torch.Tensor, scores:  torch.LongTensor, logits_entropy: torch.FloatTensor,
-                    logits_varentropy: torch.FloatTensor, attn_entropy: torch.FloatTensor,
-                    attn_varentropy: torch.FloatTensor, agreement: torch.FloatTensor,
-                    interaction_strength: torch.FloatTensor) -> torch.Tensor:
+    def _score_sample(
+        self,
+        sample: torch.Tensor,
+        scores: torch.LongTensor,
+        logits_entropy: torch.FloatTensor,
+        logits_varentropy: torch.FloatTensor,
+        attn_entropy: torch.FloatTensor,
+        attn_varentropy: torch.FloatTensor,
+        agreement: torch.FloatTensor,
+        interaction_strength: torch.FloatTensor,
+    ) -> torch.Tensor:
         # Flatten the sample tensor and convert to long (int64)
         sample_flat = sample.flatten().to(torch.long)
-        
+
         # Create one-hot encoding
         one_hot = F.one_hot(sample_flat, scores.shape[-1])
-        
+
         # Reshape log_softmax output to match one_hot
         log_probs = F.log_softmax(scores, dim=-1).view(-1, scores.shape[-1])
-        
+
         # Calculate log probability
         log_prob = torch.sum(log_probs * one_hot)
-        
+
         confidence_score = (
-            (1 - logits_entropy) * 0.1 +
-            (1 - attn_entropy) * 0.2 +
-            (1 - logits_varentropy) * 0.3 +
-            (1 - attn_varentropy) * 0.4 +
-            agreement * 0.5 +
-            interaction_strength * 0.6
+            (1 - logits_entropy) * 0.1
+            + (1 - attn_entropy) * 0.2
+            + (1 - logits_varentropy) * 0.3
+            + (1 - attn_varentropy) * 0.4
+            + agreement * 0.5
+            + interaction_strength * 0.6
         )
         return log_prob + confidence_score
-    
+
+
 def build_huggingface_pipeline(
     llm_model_id: str,
     llm_lora_model_id: str,
@@ -806,8 +975,8 @@ def build_huggingface_pipeline(
         model=model,
         tokenizer=tokenizer,
         max_new_tokens=max_new_tokens,
-        temperature=temperature, # TODO: Remove? Use as base?
-        do_sample=True, #Important!!
+        temperature=temperature,  # TODO: Remove? Use as base?
+        do_sample=True,  # Important!!
         streamer=streamer,
         stopping_criteria=stopping_criteria,
     )

@@ -9,11 +9,14 @@ from tools.bot import load_bot
 logger = logging.getLogger(__name__)
 
 
-def evaluate_w_ragas(query: str, context: list[str], output: str, ground_truth: str, metrics: list) -> dict:
+def evaluate_w_ragas(
+    query: str, context: list[str], output: str, ground_truth: str, metrics: list
+) -> dict:
     """
     Evaluate the RAG (query,context,response) using RAGAS
     """
     from ragas import evaluate
+
     data_sample = {
         "question": [query],  # Question as Sequence(str)
         "answer": [output],  # Answer as Sequence(str)
@@ -47,21 +50,22 @@ def run_local(
     # Import ragas only after loading the environment variables inside load_bot()
     from ragas.metrics import (
         answer_similarity,
-        #context_entity_recall,
+        # context_entity_recall,
         context_recall,
-        #context_relevancy,
-        #context_utilization,
-        faithfulness
+        # context_relevancy,
+        # context_utilization,
+        faithfulness,
     )
     from ragas.metrics.context_precision import context_relevancy
+
     metrics = [
-        #context_utilization,
+        # context_utilization,
         context_relevancy,
         context_recall,
         answer_similarity,
-        #context_entity_recall,
-        #answer_correctness,
-        faithfulness
+        # context_entity_recall,
+        # answer_correctness,
+        faithfulness,
     ]
 
     results = []
@@ -75,15 +79,22 @@ def run_local(
             }
             output_context = bot.finbot_chain.chains[0].run(input_payload)
             response = bot.answer(**input_payload)
-            ragas_metrics = evaluate_w_ragas(query=elem["question"], context=output_context.split('\n'), 
-                                             output=response, ground_truth=elem["response"], metrics=metrics)
-            results.append({
-                "question": elem["question"],
-                "context": output_context,
-                "ground_truth": elem["response"],
-                "response": response,
-                "metrics": ragas_metrics
-            })
+            ragas_metrics = evaluate_w_ragas(
+                query=elem["question"],
+                context=output_context.split("\n"),
+                output=response,
+                ground_truth=elem["response"],
+                metrics=metrics,
+            )
+            results.append(
+                {
+                    "question": elem["question"],
+                    "context": output_context,
+                    "ground_truth": elem["response"],
+                    "response": response,
+                    "metrics": ragas_metrics,
+                }
+            )
             logger.info("#" * 100)
             logger.info("Question: %s", elem["question"])
             logger.info("Context: %s", output_context)
@@ -91,7 +102,6 @@ def run_local(
             logger.info("Response: %s", response)
             logger.info("Score: %s", ragas_metrics)
             logger.info("#" * 100)
-
 
     with open(f'results_{datetime.now().strftime("%Y%m%d-%H%M%S")}.json', "w") as f:
         json.dump(results, f)
