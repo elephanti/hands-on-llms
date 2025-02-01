@@ -46,7 +46,6 @@ def run_local(
     bot = load_bot(model_cache_dir=None)
     # Import ragas only after loading the environment variables inside load_bot()
     from ragas.metrics import (
-        answer_correctness,
         answer_similarity,
         #context_entity_recall,
         context_recall,
@@ -76,7 +75,8 @@ def run_local(
             }
             output_context = bot.finbot_chain.chains[0].run(input_payload)
             response = bot.answer(**input_payload)
-            ragas_metrics = evaluate_w_ragas(query=elem["question"], context=output_context.split('\n'), output=response, ground_truth=elem["response"], metrics=metrics)
+            ragas_metrics = evaluate_w_ragas(query=elem["question"], context=output_context.split('\n'), 
+                                             output=response, ground_truth=elem["response"], metrics=metrics)
             results.append({
                 "question": elem["question"],
                 "context": output_context,
