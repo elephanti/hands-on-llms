@@ -126,6 +126,8 @@ class StopOnTokens(StoppingCriteria):
 
 class MinPLogitsWarper(LogitsProcessor):
     """
+    ***Copied from newer version of the transformers library to make it compatible with the Entropix sampling method.***
+
     [`LogitsProcessor`] that performs min-p, i.e. keeps all tokens that are above a minimum probability, scaled by the
     probability of the most likely token. As a result, the filter becomes more agressive in the presence of
     high-probability tokens, which is a sign of a confident output that we shouldn't deviate from.
@@ -217,8 +219,6 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
         entropy, varentropy = self._calculate_varentropy_logsoftmax(logits)
         all_attention_scores = torch.stack(attention_scores, dim=2) 
         
-        # TODO: Should we calculate the attn entropy from the last layer only? Unclear from the paper.
-
         last_layer_attention_scores = attention_scores[-1]
 
         # Focus on the newly generated token (last token in the sequence)
@@ -238,6 +238,7 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
         agreement = torch.mean(abs_diff, dim=(1, 2))  # shape: (batch_size, num_heads)
                 
         interaction_strength = torch.mean(torch.abs(all_attention_scores), dim=(1, 2, 3, 4))
+
         return {
             "logits_entropy": entropy,
             "logits_varentropy": varentropy,
@@ -265,7 +266,9 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
         **model_kwargs,
     ) -> Union[SampleOutput, torch.LongTensor]:
         r"""
-        Generates sequences of token ids for models with a language modeling head using **multinomial sampling** and
+        *** Slightly modified version of the `sample` method from the `GenerationMixin` class in the transformers library. ***
+
+        Generates sequences of token ids for models with a language modeling head using Entropix sampling method and
         can be used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
 
         <Tip warning={true}>
@@ -321,58 +324,6 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
             [`~generation.SampleDecoderOnlyOutput`] if `model.config.is_encoder_decoder=False` and
             `return_dict_in_generate=True` or a [`~generation.SampleEncoderDecoderOutput`] if
             `model.config.is_encoder_decoder=True`.
-
-        Examples:
-
-        ```python
-        >>> from transformers import (
-        ...     AutoTokenizer,
-        ...     AutoModelForCausalLM,
-        ...     LogitsProcessorList,
-        ...     MinLengthLogitsProcessor,
-        ...     TopKLogitsWarper,
-        ...     TemperatureLogitsWarper,
-        ...     StoppingCriteriaList,
-        ...     MaxLengthCriteria,
-        ... )
-        >>> import torch
-
-        >>> tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        >>> model = AutoModelForCausalLM.from_pretrained("gpt2")
-
-        >>> # set pad_token_id to eos_token_id because GPT2 does not have a EOS token
-        >>> model.config.pad_token_id = model.config.eos_token_id
-        >>> model.generation_config.pad_token_id = model.config.eos_token_id
-
-        >>> input_prompt = "Today is a beautiful day, and"
-        >>> input_ids = tokenizer(input_prompt, return_tensors="pt").input_ids
-
-        >>> # instantiate logits processors
-        >>> logits_processor = LogitsProcessorList(
-        ...     [
-        ...         MinLengthLogitsProcessor(15, eos_token_id=model.generation_config.eos_token_id),
-        ...     ]
-        ... )
-        >>> # instantiate logits processors
-        >>> logits_warper = LogitsProcessorList(
-        ...     [
-        ...         TopKLogitsWarper(50),
-        ...         TemperatureLogitsWarper(0.7),
-        ...     ]
-        ... )
-
-        >>> stopping_criteria = StoppingCriteriaList([MaxLengthCriteria(max_length=20)])
-
-        >>> torch.manual_seed(0)  # doctest: +IGNORE_RESULT
-        >>> outputs = model.sample(
-        ...     input_ids,
-        ...     logits_processor=logits_processor,
-        ...     logits_warper=logits_warper,
-        ...     stopping_criteria=stopping_criteria,
-        ... )
-
-        >>> tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        ['Today is a beautiful day, and we must do everything possible to make it a day of celebration.']
         ```"""
         # init values
         if logits_processor or logits_warper:
@@ -380,7 +331,9 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                 "The logits_processor and logits_warper will be ignored when using Entropix. "
                 "These are not compatible with the Entropix method."
             )
+
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+        
         if max_length is not None:
             warnings.warn(
                 "`max_length` is deprecated in this function, use"
@@ -388,10 +341,13 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                 UserWarning,
             )
             stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
+
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+        
         if isinstance(eos_token_id, int):
             eos_token_id = [eos_token_id]
+        
         eos_token_id_tensor = torch.tensor(eos_token_id).to(input_ids.device) if eos_token_id is not None else None
         output_scores = output_scores if output_scores is not None else self.generation_config.output_scores
         output_attentions = (
@@ -450,9 +406,7 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                 continue  # don't waste resources running the code we don't need
 
             next_token_logits = outputs.logits[:, -1, :]
-            
-            # TODO: This doesn't work (values empty), need to find where to get the model configs from correctly
-            
+                        
             # Call entropix method to obtain next_tokens, next_token_scores
             temperature = self.generation_config.temperature if hasattr(self.generation_config, "temperature") else 0.666
             top_p = self.generation_config.top_p if hasattr(self.generation_config, "top_p") else 0.9
@@ -470,7 +424,6 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                 min_p=min_p
             )
 
-            # logger.info(f"Next tokens: {next_tokens}")
             # Store scores, attentions and hidden_states when required
             if return_dict_in_generate:
                 if output_scores:
@@ -568,7 +521,6 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
                     - The final scores used for sampling (`torch.FloatTensor` of shape `(batch_size, config.vocab_size)`).
         """
         metrics = self._calculate_metrics(logits, attention_scores)
-        # logger.info("Metrics: %s", metrics)
         ent, vent = metrics["logits_entropy"], metrics["logits_varentropy"]
         attn_ent, attn_vent = metrics["attn_entropy"], metrics["attn_varentropy"]
         agreement = metrics["agreement"]
@@ -590,20 +542,16 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
             # Strategy selection
             if ent_i < 0.1 and vent_i < 0.1:
                 # Flowing with unspoken intent
-                # logger.info(f"Flowing with unspoken intent (greedy sampling)")
                 sampled_tokens[i] = torch.argmax(logits[i], dim=-1)
                 next_token_scores[i] = logits[i]
             
             elif ent_i > 3.0 and vent_i < 0.1:                    
-                # logger.info(f"Asking clarifying questions")
                 # Asking clarifying questions
                 if 2564 not in input_ids_i:
-                    # logger.info(f"Inserting 'ask clarifying question' token")
                     sampled_tokens[i] = 2564  # "Ask clarifying question" token
                     next_token_scores[i] = logits[i]
                 else:
                     temp_adj = 1.3 + 0.2 * attn_ent_i
-                    # logger.info(f"temperature: {min(1.5, temperature * temp_adj)}, top_p: {top_p}, top_k: {top_k}, min_p: {min_p}")
                     sampled_tokens[i], next_token_scores[i] = self._sample_internal(
                         input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
                         temperature=min(1.5, temperature * temp_adj),
@@ -612,10 +560,8 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
 
             elif ent_i < 5.0 and vent_i > 5.0:
                 # Exploring forks in the path
-                # logger.info(f"Exploring forks in the path (Exploration Sampling)")
                 temp_adj = 1.2 + 0.3 * interaction_strength_i
                 top_k_adj = max(5, int(top_k * (1 + 0.5 * (1 - agreement_i))))
-                # logger.info(f"temperature: {temperature * temp_adj}, top_p: {top_p}, top_k: {top_k_adj}, min_p: {min_p}")
                 sampled_tokens[i], next_token_scores[i] = self._sample_internal(
                     input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
                     temperature=min(1.5, temperature * temp_adj),
@@ -624,10 +570,8 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
 
             elif ent_i > 5.0 and vent_i > 5.0:
                 # Resampling in the mist
-                # logger.info(f"Resampling in the mist (High Uncertainty Sampling)")
                 temp_adj = 2.0 + 0.5 * attn_vent_i
                 top_p_adj = max(0.5, top_p - 0.2 * attn_ent_i)
-                # logger.info(f"temperature: {max(2.0, temperature * temp_adj)}, top_p: {top_p_adj}, top_k: {top_k}, min_p: {min_p}")
                 sampled_tokens[i], next_token_scores[i] = self._sample_internal(
                     input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
                     temperature=max(2.0, temperature * temp_adj),
@@ -636,7 +580,6 @@ class FalconForCausalLMWithEntropix(FalconForCausalLM, GenerationMixin):
 
             else:
                 # Middle ground: adaptive sampling
-                # logger.info(f"Adaptive sampling")
                 sampled_tokens[i], next_token_scores[i] = self._adaptive_sample(
                     input_ids_i.unsqueeze(0), logits[i].unsqueeze(0),
                     ent_i, vent_i, attn_ent_i, attn_vent_i, agreement_i, interaction_strength_i,
@@ -889,16 +832,6 @@ def build_qlora_model(
         trust_remote_code=False,
         cache_dir=str(cache_dir) if cache_dir else None,
     )
-
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     pretrained_model_name_or_path,
-    #     revision="main",
-    #     quantization_config=bnb_config,
-    #     load_in_4bit=True,
-    #     device_map="auto",
-    #     trust_remote_code=False,
-    #     cache_dir=str(cache_dir) if cache_dir else None,
-    # )
 
     tokenizer = AutoTokenizer.from_pretrained(
         pretrained_model_name_or_path,
